@@ -1,0 +1,20 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug Watcher",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/watcher.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "DEBUG": "true",
+                "WATCH_SERVICES": "otter-wiki,ts-otter-wiki,otter-wiki-watcher",
+                "WATCH_INTERVAL": "10",
+                "RECOVERY_TIMEOUT": "30",
+                "HOST_PWD": "~/Repository/otter-wiki-on-tailscale"
+            }
+        }
+    ]
+}
