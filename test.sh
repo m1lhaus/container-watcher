@@ -20,6 +20,8 @@ set +a
 : "${IMAGE_NAME:?IMAGE_NAME must be set in .env}"
 : "${CONTAINER_NAME:?CONTAINER_NAME must be set in .env}"
 : "${HOST_PWD:?HOST_PWD must be set in .env}"
+: "${HOST_HOSTNAME:?HOST_HOSTNAME must be set in .env}"
+: "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME must be set in .env}"
 : "${WATCH_SERVICES:?WATCH_SERVICES must be set in .env}"
 : "${WATCH_INTERVAL:?WATCH_INTERVAL must be set in .env}"
 : "${RECOVERY_TIMEOUT:?RECOVERY_TIMEOUT must be set in .env}"

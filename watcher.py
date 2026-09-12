@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """Container health watcher for Docker Compose projects.
 
-This script periodically inspects a comma-separated list of watched containers
-from WATCH_SERVICES. For each service it checks whether the container exists,
-whether it is running, and whether it exposes a Docker health status.
+This script periodically inspects a comma-separated list of watched Compose services
+from WATCH_SERVICES. For each service it checks whether the container is running, 
+and whether it exposes a Docker health status.
 
-If a watched container is missing, not running, or reports "unhealthy", the
+If a watched service is missing, not running, or reports "unhealthy", the
 watcher marks itself unhealthy and waits for a recovery timeout before running a
 recovery that stops and removes the watched containers before asking Compose to
 recreate them:
 
-    docker stop <watched-container>
-    docker rm -f <watched-container>
-    docker compose up -d
+    docker stop <container-id>
+    docker rm -f <container-id>
+    docker compose up -d <service>
 
 The heartbeat file stored at /tmp/watcher.heartbeat is rewritten every cycle with
 "healthy" or "unhealthy" so parent container health checks can tell whether the
 watcher is currently in a good state.
 
 Required environment variables:
-    WATCH_SERVICES - comma-separated list of container names to watch
+    WATCH_SERVICES - comma-separated list of Compose service names to watch
+    COMPOSE_PROJECT_NAME - Compose project containing the watched services
 
 Optional environment variables:
     WATCH_INTERVAL - seconds between checks (default: 30)
@@ -37,7 +38,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-TIMEOUT=int(os.environ.get("RECOVERY_TIMEOUT", "30"))
+TIMEOUT = int(os.environ.get("RECOVERY_TIMEOUT", "30"))
 HEARTBEAT = Path("/tmp/watcher.heartbeat")
 DOCKER_INSPECT_FORMAT = (
     "{{.State.Running}}|"
@@ -59,9 +60,40 @@ def write_heartbeat(status):
     HEARTBEAT.write_text(f"{status}\n", encoding="ascii")
 
 
-def inspect_container(name):
+def container_id_for_service(service, project, environment):
     result = subprocess.run(
-        ["docker", "inspect", f"--format={DOCKER_INSPECT_FORMAT}", name],
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            f"label=com.docker.compose.project={project}",
+            "--filter",
+            f"label=com.docker.compose.service={service}",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+
+    container_ids = result.stdout.splitlines()
+    if len(container_ids) > 1:
+        log(
+            f"[ERROR] multiple containers found for service {service} "
+            f"in project {project}: {container_ids}",
+            error=True,
+        )
+        return None
+    return container_ids[0] if container_ids else None
+
+
+def inspect_container(container_id, environment):
+    result = subprocess.run(
+        ["docker", "inspect", f"--format={DOCKER_INSPECT_FORMAT}", container_id],
+        env=environment,
         capture_output=True,
         text=True,
         check=False,
@@ -73,35 +105,53 @@ def inspect_container(name):
     return running == "true", health
 
 
-def compose_working_dir():
-    pwd = os.environ.get("HOST_PWD", "")
-    if pwd:
-        pwd = os.path.expanduser(pwd)
-        pwd = os.path.abspath(pwd)
-        if os.path.isdir(pwd):
-            return pwd
-    return os.getcwd()
-
-
 def compose_environment():
     environment = os.environ.copy()
     environment["HOSTNAME"] = os.environ.get("HOST_HOSTNAME", environment.get("HOSTNAME", ""))
-    environment["PWD"] = compose_working_dir()
+    environment["PWD"] = os.environ.get("HOST_PWD", os.getcwd())
     return environment
 
 
 def recover(services):
     log("Running Compose recovery")
     environment = compose_environment()
+    project = environment["COMPOSE_PROJECT_NAME"]
 
-    for svc in services:
-        log(f"Stopping and removing service {svc}")
-        subprocess.run(["docker", "stop", svc], cwd=environment["PWD"], env=environment, check=False)
-        subprocess.run(["docker", "rm", "-f", svc], cwd=environment["PWD"], env=environment, check=False)
+    for service in services:
+        container_id = container_id_for_service(service, project, environment)
+        if container_id is None:
+            log(f"{service} container is already missing")
+            continue
+        log(f"Stopping and removing service {service} ({container_id[:12]})")
+        subprocess.run(["docker", "stop", container_id], env=environment, check=False)
+        subprocess.run(["docker", "rm", "-f", container_id], env=environment, check=False)
 
-    up = subprocess.run(["docker", "compose", "up", "-d"], cwd=environment["PWD"], env=environment, check=False)
+    # adjust cwd so the script can be executed separately (e.g. debugger)
+    running_in_docker = "/workspace" == os.getcwd()
+    proc_wd = os.getcwd() if running_in_docker else environment["PWD"]
+
+    debug(f"Compose services to recover: {services}")
+    up = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--project-directory",              # so that relative paths in compose files are resolved correctly (e.g. binding volumes)
+            environment["PWD"],
+            "-f",
+            proc_wd + "/compose.yaml",
+            "--env-file",
+            proc_wd + "/.env",                  # .env file is not picked up automatically when using --project-directory
+            "up",
+            "-d",
+            *dict.fromkeys(services),           # otherwise compose kills all services from the compose file including the watcher
+        ],
+        cwd=proc_wd,
+        env=environment,
+        check=False,
+    )
+
     if up.returncode != 0:
-        log("ERROR: docker compose up -d failed", error=True)
+        log("[ERROR] docker compose up -d failed", error=True)
         return False
 
     log("Compose recovery completed")
@@ -116,21 +166,33 @@ def stop_watcher(signum, _frame):
 def main():
     services_value = os.environ.get("WATCH_SERVICES")
     if not services_value:
-        print("ERROR: WATCH_SERVICES must be set", file=sys.stderr)
+        print("[ERROR] WATCH_SERVICES must be set", file=sys.stderr)
+        return 1
+
+    if not os.environ.get("COMPOSE_PROJECT_NAME"):
+        print("[ERROR] COMPOSE_PROJECT_NAME must be set", file=sys.stderr)
+        return 1
+
+    if not os.environ.get("HOST_PWD"):
+        print("[ERROR] HOST_PWD must be set", file=sys.stderr)
+        return 1
+
+    if not os.environ.get("HOST_HOSTNAME"):
+        print("[ERROR] HOST_HOSTNAME must be set", file=sys.stderr)
         return 1
 
     services = [service.strip() for service in services_value.split(",") if service.strip()]
     if not services:
-        print("ERROR: WATCH_SERVICES must contain at least one container name", file=sys.stderr)
+        print("[ERROR] WATCH_SERVICES must contain at least one container name", file=sys.stderr)
         return 1
 
     try:
         interval = float(os.environ.get("WATCH_INTERVAL", "30"))
     except ValueError:
-        print("ERROR: WATCH_INTERVAL must be a number", file=sys.stderr)
+        print("[ERROR] WATCH_INTERVAL must be a number", file=sys.stderr)
         return 1
     if interval < 0:
-        print("ERROR: WATCH_INTERVAL must not be negative", file=sys.stderr)
+        print("[ERROR] WATCH_INTERVAL must not be negative", file=sys.stderr)
         return 1
 
     signal.signal(signal.SIGTERM, stop_watcher)
@@ -147,9 +209,10 @@ def main():
         recovery_needed = False
 
         for service in services:
-            inspection = inspect_container(service)
+            container_id = container_id_for_service(service, os.environ["COMPOSE_PROJECT_NAME"], os.environ)
+            inspection = inspect_container(container_id, os.environ) if container_id else None
             if inspection is None:
-                log(f"ERROR: {service} does not exist; recovery required", error=True)
+                log(f"[ERROR] {service} container does not exist; recovery required", error=True)
                 recovery_needed = True
                 continue
 
@@ -157,28 +220,30 @@ def main():
             debug(f"{service} running={str(running).lower()} health={health}")
 
             if not running:
-                log(f"ERROR: {service} is not running; recovery required", error=True)
+                log(f"[ERROR] {service} is not running; recovery required", error=True)
                 recovery_needed = True
             elif health == "no-healthcheck":
-                log(f"ERROR: {service} has no health check configured", error=True)
+                log(f"[ERROR] {service} has no health check configured", error=True)
                 watcher_status = "unhealthy"
             elif health == "unhealthy":
                 log(f"{service} is unhealthy; recovery required")
                 recovery_needed = True
 
-        write_heartbeat(watcher_status)
         if recovery_needed:
             if recovery_needed_at is None:
                 debug(f"Recovery needed, postponing recovery until timeout")
                 recovery_needed_at = time.time()
             elif (time.time() - recovery_needed_at) < TIMEOUT:
                 debug(f"Recovery needed, postponing recovery until timeout")
-                continue    # avoid premature recovery (e.g. due to currently running compose down and up) 
+                continue    # avoid premature recovery (e.g. due to currently running compose down and up)
             else:
-                recover(services)
+                if not recover(services):
+                    watcher_status = "unhealthy"
                 recovery_needed_at = None
         else:
             recovery_needed_at = None
+
+        write_heartbeat(watcher_status)
 
 
 if __name__ == "__main__":

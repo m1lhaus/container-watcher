@@ -1,18 +1,18 @@
 # container-watcher
 
 A tiny Docker Compose health watcher written in Python. It periodically checks a
-comma-separated list of named containers and, if any of them are missing,
+comma-separated list of Compose service names and, if any of them are missing,
 not running, or reported as `unhealthy`, it runs a full recovery cycle:
 
 ```bash
-docker stop <watched-container>
-docker rm -f <watched-container>
-docker compose up -d
+docker stop <container-id>
+docker rm -f <container-id>
+docker compose up -d <watched-service>
 ```
 
-The stop and remove steps are performed for every container in
-`WATCH_SERVICES`. The watcher service is left running so it can recover the
-other services from inside the Compose project.
+The watcher finds each service's container using the Compose project and service
+labels, so watched services do not need a manually configured `container_name`.
+The stop and remove steps are performed for every service in `WATCH_SERVICES`.
 
 Published as a multi-arch (amd64/arm64) image at
 `ghcr.io/m1lhaus/container-watcher`.
@@ -35,9 +35,11 @@ services:
       start_period: 40s
     working_dir: /workspace
     environment:
-      - WATCH_SERVICES=myapp,worker,db
-      - WATCH_INTERVAL=60     # how often to check the watched containers
+      - WATCH_SERVICES=myapp,worker,db  # Compose service names
+      - WATCH_INTERVAL=60               # how often to check the watched services
       - RECOVERY_TIMEOUT=30   # delay before retrying a recovery after a failed condition
+      - COMPOSE_PROJECT_NAME=myapp  # Compose project name (folder name)
+      - HOST_PWD=${PWD}
       - HOST_HOSTNAME=${HOSTNAME}
       - DEBUG=${WATCHER_DEBUG:-false}
     volumes:
@@ -49,10 +51,11 @@ services:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `WATCH_SERVICES` | yes | — | Comma-separated list of container names to watch; do not include the watcher container. |
+| `WATCH_SERVICES` | yes | — | Comma-separated list of Compose service names to watch; do not include the watcher service. |
 | `WATCH_INTERVAL` | no | `30` | Seconds between checks. |
-| `HOST_PWD` | no | current working directory | Host project directory used as the Compose working directory so the container resolves the right project files. |
-| `HOST_HOSTNAME` | yes | container hostname | Host `HOSTNAME` forwarded into the Compose environment when needed by your compose file. |
+| `COMPOSE_PROJECT_NAME` | yes | — | Compose project name used to identify the correct project and its service containers. Usually the folder name of the project. |
+| `HOST_PWD` | yes | — | Absolute path to the host project directory. It is used as the Compose project directory and should be mounted at `/workspace`. |
+| `HOST_HOSTNAME` | yes | — | Host `HOSTNAME` forwarded into the Compose environment when needed by your compose file. |
 | `DEBUG` | no | `false` | Set to `true` for per-check debug logging. |
 | `RECOVERY_TIMEOUT` | no | `30` | Delay before the watcher retries a Compose recovery after a failed condition has been observed. |
 
@@ -62,13 +65,17 @@ services:
   and manage the Compose project.
 - Mount the project directory to `/workspace` so `docker compose` runs in the
   correct project directory when Compose needs to resolve the project stack.
-- Set `WATCH_SERVICES` to the actual container names that Compose creates, and
-  do not include the watcher container itself.
+  The mount should match `HOST_PWD`.
+- Provide the Compose project files at `/workspace/compose.yaml` and
+  `/workspace/.env`.
+- Set `WATCH_SERVICES` to service names defined under `services:` in your Compose
+  file. Do not include the watcher service itself.
 
 ## How it works
 
-Every `WATCH_INTERVAL` seconds, the watcher iterates over each container name in
-`WATCH_SERVICES` and inspects it via `docker inspect`.
+Every `WATCH_INTERVAL` seconds, the watcher iterates over each Compose service
+name in `WATCH_SERVICES`, finds its container using the Compose project and
+service labels, and inspects it via `docker inspect`.
 
 For each watched service:
 
@@ -81,15 +88,20 @@ For each watched service:
 4. If the container is healthy, the watcher continues.
 5. If the container is `unhealthy`, the watcher schedules a recovery.
 
-If any watched container triggered a recovery condition, the watcher runs a
+If any watched service triggered a recovery condition, the watcher runs a
 Compose recovery once per cycle after a configurable `RECOVERY_TIMEOUT` delay.
-It stops and removes each container in `WATCH_SERVICES`, then asks Compose to
-recreate the missing containers:
+It stops and removes the container for each service in `WATCH_SERVICES`, then
+asks Compose to recreate only the affected services. The watcher runs a command
+equivalent to:
 
 ```bash
-docker stop <watched-container>
-docker rm -f <watched-container>
-docker compose up -d
+docker stop <container-id>
+docker rm -f <container-id>
+docker compose \
+  --project-directory "$HOST_PWD" \
+  -f /workspace/compose.yaml \
+  --env-file /workspace/.env \
+  up -d <watched-service> [...]
 ```
 
 The `RECOVERY_TIMEOUT` ensures that the watcher doesn't start a recovery when,
@@ -113,7 +125,6 @@ file. See simplified example below.
 services:
   ts-otter-wiki:
     image: tailscale/tailscale:latest
-    container_name: ts-otter-wiki
     ...
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:41234/healthz"]
@@ -125,7 +136,6 @@ services:
   
   otter-wiki:
     image: redimp/otterwiki:2
-    container_name: otter-wiki
     restart: unless-stopped
     network_mode: "service:ts-otter-wiki"
     depends_on:
@@ -141,8 +151,13 @@ services:
 
   watcher:
     image: ghcr.io/m1lhaus/container-watcher:latest
-    container_name: otter-wiki-watcher
     restart: on-failure
+    working_dir: /workspace
+    environment:
+      - WATCH_SERVICES=ts-otter-wiki,otter-wiki
+      - COMPOSE_PROJECT_NAME=otter-wiki-on-tailscale  # name of the folder
+      - HOST_PWD=${PWD} 
+      - HOST_HOSTNAME=${HOSTNAME} 
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/watcher.heartbeat && grep -qE '^(healthy|unhealthy)$' /tmp/watcher.heartbeat && test $(find /tmp/watcher.heartbeat -mmin -2 2>/dev/null | wc -l) -eq 1"]
       interval: 1m
