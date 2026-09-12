@@ -7,9 +7,12 @@ whether it is running, and whether it exposes a Docker health status.
 
 If a watched container is missing, not running, or reports "unhealthy", the
 watcher marks itself unhealthy and waits for a recovery timeout before running a
-full Compose recovery:
+recovery that stops and removes the watched containers before asking Compose to
+recreate them:
 
-    docker compose down && docker compose up -d
+    docker stop <watched-container>
+    docker rm -f <watched-container>
+    docker compose up -d
 
 The heartbeat file stored at /tmp/watcher.heartbeat is rewritten every cycle with
 "healthy" or "unhealthy" so parent container health checks can tell whether the
@@ -87,13 +90,14 @@ def compose_environment():
     return environment
 
 
-def recover():
+def recover(services):
     log("Running Compose recovery")
     environment = compose_environment()
-    down = subprocess.run(["docker", "compose", "down"], cwd=environment["PWD"], env=environment, check=False)
-    if down.returncode != 0:
-        log("ERROR: docker compose down failed", error=True)
-        return False
+
+    for svc in services:
+        log(f"Stopping and removing service {svc}")
+        subprocess.run(["docker", "stop", svc], cwd=environment["PWD"], env=environment, check=False)
+        subprocess.run(["docker", "rm", "-f", svc], cwd=environment["PWD"], env=environment, check=False)
 
     up = subprocess.run(["docker", "compose", "up", "-d"], cwd=environment["PWD"], env=environment, check=False)
     if up.returncode != 0:
@@ -171,7 +175,7 @@ def main():
                 debug(f"Recovery needed, postponing recovery until timeout")
                 continue    # avoid premature recovery (e.g. due to currently running compose down and up) 
             else:
-                recover()
+                recover(services)
                 recovery_needed_at = None
         else:
             recovery_needed_at = None
