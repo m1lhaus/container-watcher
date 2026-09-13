@@ -28,7 +28,7 @@ services:
     container_name: myapp-watcher
     restart: on-failure
     healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/watcher.heartbeat && grep -qE '^(healthy|unhealthy)$' /tmp/watcher.heartbeat && test $(find /tmp/watcher.heartbeat -mmin -2 2>/dev/null | wc -l) -eq 1"]
+      test: ["CMD-SHELL", "test -f /tmp/watcher.heartbeat && grep -q '^healthy$' /tmp/watcher.heartbeat && test $(find /tmp/watcher.heartbeat -mmin -2 2>/dev/null | wc -l) -eq 1"]
       interval: 1m
       timeout: 5s
       retries: 3
@@ -79,20 +79,27 @@ service labels, and inspects it via `docker inspect`.
 
 For each watched service:
 
-1. If the container does not exist, it is treated as failed and marks the watcher
-   as unhealthy.
-2. If the container exists but is not running, it is treated as failed and marks
-   the watcher as unhealthy.
-3. If the container has no health check configured, it logs an error and marks
-   the watcher as unhealthy.
+1. If the container does not exist (or cannot be inspected), the watcher marks
+   itself as unhealthy and schedules a recovery.
+2. If the container exists but is not running, the watcher schedules a
+   recovery.
+3. If the container has no health check configured, the watcher logs an error
+   and marks itself as unhealthy.
 4. If the container is healthy, the watcher continues.
 5. If the container is `unhealthy`, the watcher schedules a recovery.
+
+In other words, the watcher reports itself as unhealthy only when a watched
+container is missing, a watched service has no health check configured, or a
+recovery attempt has failed. During the `RECOVERY_TIMEOUT` grace period it
+keeps reporting `healthy`, so a brief manual Compose operation does not flap
+its status.
 
 If any watched service triggered a recovery condition, the watcher runs a
 Compose recovery once per cycle after a configurable `RECOVERY_TIMEOUT` delay.
 It stops and removes the container for each service in `WATCH_SERVICES`, then
-asks Compose to recreate only the affected services. The watcher runs a command
-equivalent to:
+asks Compose to recreate exactly those services. Any other services defined in
+the Compose file (including the watcher itself) are left untouched. The watcher
+runs a command equivalent to:
 
 ```bash
 docker stop <container-id>
@@ -110,9 +117,14 @@ any value > 0 means that the service must be unhealthy for more than one watch
 interval before a recovery is attempted.
 
 The heartbeat file (`/tmp/watcher.heartbeat`) is rewritten every cycle with the
-current watcher status: `healthy` or `unhealthy`. This is intended to be used by
-an outer container healthcheck, so external monitoring can see whether the
-watcher is currently in a good state.
+current watcher status: `healthy` or `unhealthy`. The example healthchecks above
+treat the watcher as healthy only when the file exists, is fresh, and contains
+`healthy`; a missing, stale, or `unhealthy` heartbeat fails the check, so Docker
+and external monitoring can see when the watcher (or one of its watched
+services) is not in a good state. Keep `WATCH_INTERVAL` comfortably below
+the staleness window of that healthcheck (2 minutes in the examples above);
+otherwise the heartbeat file ages out between checks and the watcher container
+itself is reported as unhealthy.
 
 ## Example use case
 
@@ -159,7 +171,7 @@ services:
       - HOST_PWD=${PWD} 
       - HOST_HOSTNAME=${HOSTNAME} 
     healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/watcher.heartbeat && grep -qE '^(healthy|unhealthy)$' /tmp/watcher.heartbeat && test $(find /tmp/watcher.heartbeat -mmin -2 2>/dev/null | wc -l) -eq 1"]
+      test: ["CMD-SHELL", "test -f /tmp/watcher.heartbeat && grep -q '^healthy$' /tmp/watcher.heartbeat && test $(find /tmp/watcher.heartbeat -mmin -2 2>/dev/null | wc -l) -eq 1"]
       interval: 1m
       timeout: 5s
       retries: 3

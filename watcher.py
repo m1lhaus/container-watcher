@@ -38,7 +38,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-TIMEOUT = int(os.environ.get("RECOVERY_TIMEOUT", "30"))
 HEARTBEAT = Path("/tmp/watcher.heartbeat")
 DOCKER_INSPECT_FORMAT = (
     "{{.State.Running}}|"
@@ -181,7 +180,10 @@ def main():
         print("[ERROR] HOST_HOSTNAME must be set", file=sys.stderr)
         return 1
 
-    services = [service.strip() for service in services_value.split(",") if service.strip()]
+    # deduplicate while preserving order
+    services = list(
+        dict.fromkeys(service.strip() for service in services_value.split(",") if service.strip())
+    )
     if not services:
         print("[ERROR] WATCH_SERVICES must contain at least one container name", file=sys.stderr)
         return 1
@@ -195,16 +197,27 @@ def main():
         print("[ERROR] WATCH_INTERVAL must not be negative", file=sys.stderr)
         return 1
 
+    try:
+        timeout = float(os.environ.get("RECOVERY_TIMEOUT", "30"))
+    except ValueError:
+        print("[ERROR] RECOVERY_TIMEOUT must be a number", file=sys.stderr)
+        return 1
+    if timeout < 0:
+        print("[ERROR] RECOVERY_TIMEOUT must not be negative", file=sys.stderr)
+        return 1
+
     signal.signal(signal.SIGTERM, stop_watcher)
     signal.signal(signal.SIGINT, stop_watcher)
 
-    log(f"Compose watcher started (interval={interval:g}s, list of services: {services})")
+    log(f"Compose watcher started (interval={interval:g}s, timeout={timeout:g}s, list of services: {services})")
     write_heartbeat("healthy")
 
     recovery_needed_at = None
 
     while True:
         time.sleep(interval)
+        # the outer healthcheck treats the watcher as healthy only when the
+        # heartbeat file is fresh and contains "healthy"
         watcher_status = "healthy"
         recovery_needed = False
 
@@ -212,7 +225,8 @@ def main():
             container_id = container_id_for_service(service, os.environ["COMPOSE_PROJECT_NAME"], os.environ)
             inspection = inspect_container(container_id, os.environ) if container_id else None
             if inspection is None:
-                log(f"[ERROR] {service} container does not exist; recovery required", error=True)
+                log(f"[ERROR] {service} container is missing or cannot be inspected; recovery required", error=True)
+                watcher_status = "unhealthy"
                 recovery_needed = True
                 continue
 
@@ -226,16 +240,16 @@ def main():
                 log(f"[ERROR] {service} has no health check configured", error=True)
                 watcher_status = "unhealthy"
             elif health == "unhealthy":
-                log(f"{service} is unhealthy; recovery required")
+                log(f"[ERROR] {service} is unhealthy; recovery required", error=True)
                 recovery_needed = True
 
         if recovery_needed:
             if recovery_needed_at is None:
-                debug(f"Recovery needed, postponing recovery until timeout")
+                debug("Recovery needed, starting recovery grace period")
                 recovery_needed_at = time.time()
-            elif (time.time() - recovery_needed_at) < TIMEOUT:
-                debug(f"Recovery needed, postponing recovery until timeout")
-                continue    # avoid premature recovery (e.g. due to currently running compose down and up)
+            elif (time.time() - recovery_needed_at) < timeout:
+                remaining = timeout - (time.time() - recovery_needed_at)
+                debug(f"Recovery still needed, {remaining:.0f}s left in grace period")
             else:
                 if not recover(services):
                     watcher_status = "unhealthy"
