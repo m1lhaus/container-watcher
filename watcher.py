@@ -56,7 +56,10 @@ def debug(message):
 
 
 def write_heartbeat(status):
-    HEARTBEAT.write_text(f"{status}\n", encoding="ascii")
+    # write to a temp file and rename so the healthcheck never observes a half-written file
+    tmp_path = HEARTBEAT.with_suffix(".tmp")
+    tmp_path.write_text(f"{status}\n", encoding="ascii")
+    tmp_path.replace(HEARTBEAT)
 
 
 def container_id_for_service(service, project, environment):
@@ -76,6 +79,10 @@ def container_id_for_service(service, project, environment):
         check=False,
     )
     if result.returncode != 0:
+        log(
+            f"[ERROR] docker ps failed for service {service}: {result.stderr.strip()}",
+            error=True,
+        )
         return None
 
     container_ids = result.stdout.splitlines()
@@ -98,6 +105,11 @@ def inspect_container(container_id, environment):
         check=False,
     )
     if result.returncode != 0 or not result.stdout.strip():
+        if result.returncode != 0:
+            log(
+                f"[ERROR] docker inspect failed for container {container_id[:12]}: {result.stderr.strip()}",
+                error=True,
+            )
         return None
 
     running, health = result.stdout.strip().split("|", 1)
@@ -225,7 +237,7 @@ def main():
             container_id = container_id_for_service(service, os.environ["COMPOSE_PROJECT_NAME"], os.environ)
             inspection = inspect_container(container_id, os.environ) if container_id else None
             if inspection is None:
-                log(f"[ERROR] {service} container is missing or cannot be inspected; recovery required", error=True)
+                log(f"[ERROR] {service} container is missing, ambiguous, or cannot be inspected; recovery required", error=True)
                 watcher_status = "unhealthy"
                 recovery_needed = True
                 continue

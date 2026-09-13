@@ -55,7 +55,7 @@ services:
 | `WATCH_INTERVAL` | no | `30` | Seconds between checks. |
 | `COMPOSE_PROJECT_NAME` | yes | — | Compose project name used to identify the correct project and its service containers. Usually the folder name of the project. |
 | `HOST_PWD` | yes | — | Absolute path to the host project directory. It is used as the Compose project directory and should be mounted at `/workspace`. |
-| `HOST_HOSTNAME` | yes | — | Host `HOSTNAME` forwarded into the Compose environment when needed by your compose file. |
+| `HOST_HOSTNAME` | yes | — | Host `HOSTNAME` forwarded into the Compose environment during recovery, so recreated containers see the real host hostname instead of the watcher container's own hostname. This matters for setups (e.g. Tailscale sidecars) whose identity/config is derived from `HOSTNAME`. |
 | `DEBUG` | no | `false` | Set to `true` for per-check debug logging. |
 | `RECOVERY_TIMEOUT` | no | `30` | Delay before the watcher retries a Compose recovery after a failed condition has been observed. |
 
@@ -67,9 +67,17 @@ services:
   correct project directory when Compose needs to resolve the project stack.
   The mount should match `HOST_PWD`.
 - Provide the Compose project files at `/workspace/compose.yaml` and
-  `/workspace/.env`.
+  `/workspace/.env`. Both files must exist — the `.env` file may be empty, but
+  recovery always runs `docker compose --env-file /workspace/.env`, which fails
+  if the file is missing.
 - Set `WATCH_SERVICES` to service names defined under `services:` in your Compose
   file. Do not include the watcher service itself.
+- Each watched service must define a Compose `healthcheck`; the watcher relies on
+  the container's Docker health status to decide whether it is healthy.
+- The watcher assumes exactly one container per watched service. Compose
+  scaling (`docker compose up --scale`) that produces multiple containers for a
+  watched service is not supported and is treated the same as a missing
+  container, forcing a recovery every cycle.
 
 ## How it works
 
