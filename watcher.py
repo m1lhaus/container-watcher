@@ -18,15 +18,24 @@ The heartbeat file stored at /tmp/watcher.heartbeat is rewritten every cycle wit
 "healthy" or "unhealthy" so parent container health checks can tell whether the
 watcher is currently in a good state.
 
+`docker compose` records the paths it is given in the
+`com.docker.compose.project.config_files` and
+`com.docker.compose.project.environment_file` container labels. Those labels are
+immutable and other tools use them to locate the project files on the host, so
+the project directory must be mounted inside the watcher container at the *same*
+path it has on the host (`${PWD}:${PWD}`). Recovery then passes those host paths
+to Compose and the recreated containers carry host-valid labels.
+
 Required environment variables:
     WATCH_SERVICES - comma-separated list of Compose service names to watch
     COMPOSE_PROJECT_NAME - Compose project containing the watched services
+    HOST_PWD       - absolute host project directory (compose.yaml and .env live here);
+                     must be mounted into the container at the same path
+    HOST_HOSTNAME  - host hostname forwarded into docker compose environment
 
 Optional environment variables:
     WATCH_INTERVAL - seconds between checks (default: 30)
     DEBUG          - set to "true" for verbose logs (default: "false")
-    HOST_PWD       - host project directory used as Compose working dir
-    HOST_HOSTNAME  - host hostname forwarded into docker compose environment
     RECOVERY_TIMEOUT - seconds to wait before retrying a forced recovery
 """
 
@@ -127,6 +136,19 @@ def recover(services):
     log("Running Compose recovery")
     environment = compose_environment()
     project = environment["COMPOSE_PROJECT_NAME"]
+    project_dir = Path(environment["HOST_PWD"])
+    compose_file = project_dir / "compose.yaml"
+    env_file = project_dir / ".env"
+
+    # Validate before touching any container: if the files are not reachable,
+    # removing the containers would leave the project unrecoverable.
+    if not compose_file.is_file() or not env_file.is_file():
+        log(
+            f"[ERROR] {compose_file} and {env_file} must exist; "
+            f"is {project_dir} mounted into the container at the same path?",
+            error=True,
+        )
+        return False
 
     for service in services:
         container_id = container_id_for_service(service, project, environment)
@@ -137,26 +159,22 @@ def recover(services):
         subprocess.run(["docker", "stop", container_id], env=environment, check=False)
         subprocess.run(["docker", "rm", "-f", container_id], env=environment, check=False)
 
-    # adjust cwd so the script can be executed separately (e.g. debugger)
-    running_in_docker = "/workspace" == os.getcwd()
-    proc_wd = os.getcwd() if running_in_docker else environment["PWD"]
-
     debug(f"Compose services to recover: {services}")
     up = subprocess.run(
         [
             "docker",
             "compose",
             "--project-directory",              # so that relative paths in compose files are resolved correctly (e.g. binding volumes)
-            environment["PWD"],
+            str(project_dir),
             "-f",
-            proc_wd + "/compose.yaml",
+            str(compose_file),
             "--env-file",
-            proc_wd + "/.env",                  # .env file is not picked up automatically when using --project-directory
+            str(env_file),                      # .env file is not picked up automatically when using --project-directory
             "up",
             "-d",
             *dict.fromkeys(services),           # otherwise compose kills all services from the compose file including the watcher
         ],
-        cwd=proc_wd,
+        cwd=str(project_dir),
         env=environment,
         check=False,
     )
@@ -186,6 +204,10 @@ def main():
 
     if not os.environ.get("HOST_PWD"):
         print("[ERROR] HOST_PWD must be set", file=sys.stderr)
+        return 1
+
+    if not os.path.isabs(os.environ["HOST_PWD"]):
+        print("[ERROR] HOST_PWD must be an absolute path", file=sys.stderr)
         return 1
 
     if not os.environ.get("HOST_HOSTNAME"):

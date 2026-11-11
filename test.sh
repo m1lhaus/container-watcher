@@ -47,8 +47,8 @@ docker run \
     --name "$CONTAINER_NAME" \
     --rm \
     --init \
-    --workdir /workspace \
+    --workdir "$HOST_PWD" \
     --env-file "$ENV_FILE" \
     --volume /var/run/docker.sock:/var/run/docker.sock \
-    --volume "$HOST_PWD:/workspace" \
+    --volume "$HOST_PWD:$HOST_PWD" \
     "$IMAGE_NAME"

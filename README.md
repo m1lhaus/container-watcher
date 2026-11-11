@@ -33,7 +33,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
-    working_dir: /workspace
     environment:
       - WATCH_SERVICES=myapp,worker,db  # Compose service names
       - WATCH_INTERVAL=60               # how often to check the watched services
@@ -44,8 +43,19 @@ services:
       - DEBUG=${WATCHER_DEBUG:-false}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ${PWD}:/workspace
+      - ${PWD}:${PWD}
 ```
+
+> **Mount the project directory at the same path it has on the host.**
+> Compose writes the `-f` and `--env-file` paths it was given into the
+> `com.docker.compose.project.config_files` and
+> `com.docker.compose.project.environment_file` container labels. Labels are
+> immutable, so if Compose sees the project at a different path (for example
+> `/workspace`), every recovered container permanently advertises that path in
+> its labels — a path that doesn't exist on the host. Other tools (IDE Compose
+> integrations, dashboards, `docker compose ls`, backup scripts) then fail to
+> locate the project files. An identity mount (`${PWD}:${PWD}`) makes the paths
+> valid on both sides.
 
 ### Environment variables
 
@@ -54,7 +64,7 @@ services:
 | `WATCH_SERVICES` | yes | — | Comma-separated list of Compose service names to watch; do not include the watcher service. |
 | `WATCH_INTERVAL` | no | `30` | Seconds between checks. |
 | `COMPOSE_PROJECT_NAME` | yes | — | Compose project name used to identify the correct project and its service containers. Usually the folder name of the project. |
-| `HOST_PWD` | yes | — | Absolute path to the host project directory. It is used as the Compose project directory and should be mounted at `/workspace`. |
+| `HOST_PWD` | yes | — | Absolute path to the host project directory. It is used as the Compose project directory and must be mounted into the watcher container at the same path (`${PWD}:${PWD}`), so the paths stored in the Compose labels of recreated containers are valid on the host. |
 | `HOST_HOSTNAME` | yes | — | Host `HOSTNAME` forwarded into the Compose environment during recovery, so recreated containers see the real host hostname instead of the watcher container's own hostname. This matters for setups (e.g. Tailscale sidecars) whose identity/config is derived from `HOSTNAME`. |
 | `DEBUG` | no | `false` | Set to `true` for per-check debug logging. |
 | `RECOVERY_TIMEOUT` | no | `30` | Delay before the watcher retries a Compose recovery after a failed condition has been observed. |
@@ -63,12 +73,13 @@ services:
 
 - Mount the Docker socket (`/var/run/docker.sock`) so the watcher can inspect
   and manage the Compose project.
-- Mount the project directory to `/workspace` so `docker compose` runs in the
-  correct project directory when Compose needs to resolve the project stack.
-  The mount should match `HOST_PWD`.
-- Provide the Compose project files at `/workspace/compose.yaml` and
-  `/workspace/.env`. Both files must exist — the `.env` file may be empty, but
-  recovery always runs `docker compose --env-file /workspace/.env`, which fails
+- Mount the project directory to the same absolute path inside the container
+  (`${PWD}:${PWD}`) so `docker compose` runs in the correct project directory
+  and resolves relative paths in the Compose file correctly. The mount must
+  match `HOST_PWD`.
+- Provide the Compose project files at `$HOST_PWD/compose.yaml` and
+  `$HOST_PWD/.env`. Both files must exist — the `.env` file may be empty, but
+  recovery always runs `docker compose --env-file $HOST_PWD/.env`, which fails
   if the file is missing.
 - Set `WATCH_SERVICES` to service names defined under `services:` in your Compose
   file. Do not include the watcher service itself.
@@ -114,8 +125,8 @@ docker stop <container-id>
 docker rm -f <container-id>
 docker compose \
   --project-directory "$HOST_PWD" \
-  -f /workspace/compose.yaml \
-  --env-file /workspace/.env \
+  -f "$HOST_PWD/compose.yaml" \
+  --env-file "$HOST_PWD/.env" \
   up -d <watched-service> [...]
 ```
 
@@ -172,7 +183,6 @@ services:
   watcher:
     image: ghcr.io/m1lhaus/container-watcher:latest
     restart: on-failure
-    working_dir: /workspace
     environment:
       - WATCH_SERVICES=ts-otter-wiki,otter-wiki
       - COMPOSE_PROJECT_NAME=otter-wiki-on-tailscale  # name of the folder
@@ -184,6 +194,9 @@ services:
       timeout: 5s
       retries: 3
       start_period: 40s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${PWD}:${PWD}
     ...
 ```
 
